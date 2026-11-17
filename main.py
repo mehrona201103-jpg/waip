@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,7 +30,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
+    SuccessfulPayment,
     WebAppInfo,
 )
 
@@ -57,13 +61,18 @@ CATALOG = C.CATALOG
 
 ALLOWED_KINDS = ("level", "admin", "money", "skin", "password")
 
+STARS_PER_USD = int(getattr(C, "STARS_PER_USD", 50) or 50)
+MONEY_PER_USD = int(getattr(C, "MONEY_PER_USD", 100_000) or 100_000)
+MONEY_MIN_USD = float(getattr(C, "MONEY_MIN_USD", 1) or 1)
+PASSWORD_HASH = (getattr(C, "PASSWORD_HASH", "md5") or "md5").strip().lower()
+
 PRODUCTS: dict[str, dict] = {}
 for _cat, _sec in CATALOG.items():
-    for _item in _sec["products"]:
+    for _item in _sec.get("products") or []:
         code = _item["id"]
         if code in PRODUCTS or _item["kind"] not in ALLOWED_KINDS:
             raise ValueError(f"Ошибка config.py: товар {code}")
-        if not (0 < int(_item["price"]) < 10**8 and 0 < int(_item["units"]) < 10**10):
+        if not (0 < float(_item["price"]) < 10**8 and 0 < int(_item["units"]) < 10**10):
             raise ValueError(f"Ошибка config.py: цена/units у {code}")
         PRODUCTS[code] = dict(_item, category=_cat)
 
@@ -84,7 +93,6 @@ def gen_password(length: int = 8) -> str:
         length = 8
     letters = string.ascii_letters
     digits = string.digits
-    # гарантируем минимум 2 цифры и 2 буквы
     chars = [
         random.choice(letters), random.choice(letters),
         random.choice(digits), random.choice(digits),
@@ -93,6 +101,46 @@ def gen_password(length: int = 8) -> str:
     chars += [random.choice(pool) for _ in range(length - 4)]
     random.shuffle(chars)
     return "".join(chars)
+
+
+def hash_password(plain: str) -> str:
+    """Хеширует пароль под формат игровой БД (см. PASSWORD_HASH в config).
+
+    Поддерживается: plain, md5, sha1, sha256, double_md5, whirlpool.
+    Для WHIRLPOOL нужен hashlib с поддержкой (OpenSSL) — иначе fallback md5.
+    """
+    raw = (plain or "").encode("utf-8")
+    method = PASSWORD_HASH
+    if method in ("plain", "none", ""):
+        return plain
+    if method == "md5":
+        return hashlib.md5(raw).hexdigest()
+    if method == "sha1":
+        return hashlib.sha1(raw).hexdigest()
+    if method == "sha256":
+        return hashlib.sha256(raw).hexdigest()
+    if method in ("double_md5", "md5md5"):
+        return hashlib.md5(hashlib.md5(raw).hexdigest().encode()).hexdigest()
+    if method in ("whirlpool", "wp"):
+        try:
+            return hashlib.new("whirlpool", raw).hexdigest()
+        except Exception:
+            logging.exception("whirlpool unavailable")
+            raise GrantError("Хеш whirlpool недоступен на сервере Python/OpenSSL")
+    logging.warning("Unknown PASSWORD_HASH=%s, using md5", method)
+    return hashlib.md5(raw).hexdigest()
+
+
+def usd_to_stars(usd: float) -> int:
+    return max(1, int(round(float(usd) * STARS_PER_USD)))
+
+
+def money_from_usd(usd: float) -> int:
+    return int(round(float(usd) * MONEY_PER_USD))
+
+
+def usd_from_money(units: int) -> float:
+    return round(float(units) / MONEY_PER_USD, 4)
 
 
 @dataclass(frozen=True)
@@ -128,8 +176,10 @@ def grant_sql(order: dict, cfg: GameConfig, new_password: str | None = None):
     if kind == "password":
         if not new_password:
             raise GrantError("Нет нового пароля")
+        # В БД пишем ХЕШ, игроку отдаём plain
+        stored = hash_password(new_password)
         col = identifier(cfg.password_col)
-        return f"UPDATE {table} SET {col}=%s WHERE {nick}=%s", (new_password, order["nickname"])
+        return f"UPDATE {table} SET {col}=%s WHERE {nick}=%s", (stored, order["nickname"])
 
     if kind == "skin":
         col = identifier(cfg.skin_col)
@@ -394,20 +444,21 @@ class OrderStorage:
         with self.db:
             self.db.execute("DELETE FROM category_photos WHERE category=?", (category,))
 
-    def get_price(self, product_id: str) -> int:
+    def get_price(self, product_id: str) -> float:
+        """Цена товара в USD (Stars считаются отдельно: USD * STARS_PER_USD)."""
         row = self.db.execute(
             "SELECT price FROM product_prices WHERE product_id=?", (product_id,)
         ).fetchone()
         if row:
-            return int(row["price"])
-        return int(PRODUCTS[product_id]["price"])
+            return float(row["price"])
+        return float(PRODUCTS[product_id]["price"])
 
-    def set_price(self, product_id: str, price: int) -> None:
+    def set_price(self, product_id: str, price: float) -> None:
         with self.db:
             self.db.execute(
                 "INSERT INTO product_prices(product_id,price) VALUES(?,?) "
                 "ON CONFLICT(product_id) DO UPDATE SET price=excluded.price",
-                (product_id, price),
+                (product_id, float(price)),
             )
 
     def product(self, code: str) -> dict | None:
@@ -484,6 +535,14 @@ class OrderStorage:
                 (uid, nick, 1 if registered else 0, now()),
             )
 
+    def clear_nickname(self, uid: int) -> None:
+        """Выход из игрового аккаунта — можно привязать другой ник."""
+        with self.db:
+            self.db.execute(
+                "UPDATE user_profiles SET game_nickname=NULL, registered=0, updated_at=? WHERE telegram_id=?",
+                (now(), uid),
+            )
+
     def get_nickname(self, uid: int) -> str | None:
         row = self.db.execute(
             "SELECT game_nickname FROM user_profiles WHERE telegram_id=?", (uid,)
@@ -508,7 +567,7 @@ class OrderStorage:
         return self._row(
             self.db.execute(
                 "SELECT * FROM orders WHERE telegram_id=? AND status IN "
-                "('awaiting_receipt','review','processing','awaiting_crypto') "
+                "('awaiting_receipt','awaiting_stars','review','processing','awaiting_crypto') "
                 "ORDER BY id DESC LIMIT 1",
                 (user_id,),
             )
@@ -538,24 +597,37 @@ class OrderStorage:
         promo_code: str | None = None,
         discount: int = 0,
         final_price: int | None = None,
+        units_override: int | None = None,
     ):
+        """final_price — цена в USD (целое или дробное округляется до 2 знаков → cents/100).
+        В БД price хранится как целое число Stars к оплате (USD * STARS_PER_USD).
+        """
         if self.active(telegram_id):
             raise ValueError("Есть незавершённый заказ")
         t = now()
-        price = final_price if final_price is not None else int(item["price"])
-        status = "awaiting_crypto" if payment_method == "crypto" else "awaiting_receipt"
+        usd = float(final_price if final_price is not None else item["price"])
+        stars = usd_to_stars(usd)
+        units = int(units_override if units_override is not None else item["units"])
+        status = "awaiting_crypto" if payment_method == "crypto" else "awaiting_stars"
+        title = item["title"]
+        if item["kind"] == "money" and units_override:
+            title = f"{units:,} игровой валюты".replace(",", " ")
         cur = self.db.execute(
             "INSERT INTO orders (telegram_id,nickname,item_code,item_title,kind,units,price,"
             "status,payment_method,promo_code,discount,created_at,updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                telegram_id, nickname, item_code, item["title"], item["kind"],
-                int(item["units"]), price, status, payment_method, promo_code,
+                telegram_id, nickname, item_code, title, item["kind"],
+                units, stars, status, payment_method, promo_code,
                 discount, t, t,
             ),
         )
         self.db.commit()
-        return self.get(cur.lastrowid)
+        order = self.get(cur.lastrowid)
+        if order:
+            order["usd"] = usd
+            order["stars"] = stars
+        return order
 
     def set_crypto_invoice(self, order_id: int, invoice_id: str) -> None:
         with self.db:
@@ -580,7 +652,7 @@ class OrderStorage:
     def cancel(self, order_id: int, user_id: int):
         cur = self.db.execute(
             "UPDATE orders SET status='cancelled',updated_at=? WHERE id=? AND telegram_id=? "
-            "AND status IN ('awaiting_receipt','awaiting_crypto')",
+            "AND status IN ('awaiting_receipt','awaiting_crypto','awaiting_stars','review')",
             (now(), order_id, user_id),
         )
         self.db.commit()
@@ -712,10 +784,13 @@ def home_kb(owner: bool = False, is_mod: bool = False):
 
 def section_kb(category: str):
     rows = []
-    for p in CATALOG[category]["products"]:
+    for p in CATALOG.get(category, {}).get("products") or []:
         price = store.get_price(p["id"])
-        rows.append((button(f"{p['title']} — {price} ₽", f"buy:{p['id']}", "card"),))
-    rows.append((button("⬅️ Назад", "home", "home"),))
+        stars = usd_to_stars(price)
+        rows.append((button(f"{p['title']} — ${price} / {stars}★", f"buy:{p['id']}", "card"),))
+    if category == "money":
+        rows.append((button("Своя сумма — в Web App", "home", "money"),))
+    rows.append((button("Назад", "home", "home"),))
     return keyboard(*rows)
 
 
@@ -792,16 +867,108 @@ def cryptobot_request(method: str, params: dict | None = None) -> dict:
 
 
 def create_crypto_invoice(order: dict) -> dict:
+    # price в заказе = Stars; переводим в USD для CryptoBot
+    stars = int(order["price"])
+    usd = max(0.01, round(stars / float(STARS_PER_USD), 2))
     return cryptobot_request("createInvoice", {
         "currency_type": "fiat",
-        "fiat": "RUB",
-        "amount": str(order["price"]),
+        "fiat": "USD",
+        "amount": str(usd),
         "description": f"WAIP SHOP #{order['id']} — {order['item_title']}",
         "payload": str(order["id"]),
         "expires_in": 3600,
         "allow_comments": False,
         "allow_anonymous": False,
     })
+
+
+async def create_stars_invoice_link_with_bot(bot: Bot, order: dict) -> str:
+    """Ссылка на оплату Telegram Stars (XTR) — средства на баланс бота."""
+    stars = max(1, int(order["price"]))
+    title = (order.get("item_title") or "WAIP SHOP")[:32]
+    description = f"Заказ #{order['id']} · {order.get('nickname') or ''}"[:255]
+    prices = [LabeledPrice(label=title[:32], amount=stars)]
+    link = await bot.create_invoice_link(
+        title=title,
+        description=description,
+        payload=f"waip:{order['id']}",
+        currency="XTR",
+        prices=prices,
+    )
+    return link
+
+
+async def fulfill_paid_order(bot: Bot, order_id: int, source: str = "pay") -> None:
+    """Авто-выдача после успешной оплаты (Stars XTR / CryptoBot / gift auto)."""
+    order = store.get(order_id)
+    if not order:
+        return
+    if order["status"] in ("delivered", "done"):
+        return
+    with store.db:
+        store.db.execute(
+            "UPDATE orders SET status='processing',updated_at=? WHERE id=?",
+            (now(), order_id),
+        )
+    order = store.get(order_id)
+    try:
+        result = await asyncio.to_thread(grant_to_game, order, game_config())
+        store.delivered(order_id)
+        if isinstance(result, str) and result.startswith("pwd:"):
+            await _notify_password(bot, order, result[4:])
+        else:
+            try:
+                await bot.send_message(
+                    order["telegram_id"],
+                    f"<b>Оплата получена</b>\n"
+                    f"Заказ #{order_id} — <b>{escape(order['item_title'])}</b>\n"
+                    f"Ник: <code>{escape(order['nickname'])}</code>\n"
+                    f"Товар выдан автоматически.",
+                )
+            except Exception:
+                logging.exception("notify buyer")
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"Оплата ({source}) #{order_id} → {escape(order['nickname'])} · {escape(order['item_title'])}",
+            )
+        except Exception:
+            pass
+    except GrantError as e:
+        store.retry(order_id, str(e))
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"Оплачен, но выдача упала #{order_id}:\n{escape(str(e))}",
+            )
+        except Exception:
+            pass
+        logging.exception("fulfill grant %s", order_id)
+
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(query: PreCheckoutQuery):
+    # Всегда подтверждаем — проверка заказа при successful_payment
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message, bot: Bot):
+    sp: SuccessfulPayment = message.successful_payment
+    payload = sp.invoice_payload or ""
+    if not payload.startswith("waip:"):
+        return
+    try:
+        order_id = int(payload.split(":", 1)[1])
+    except ValueError:
+        return
+    order = store.get(order_id)
+    if not order:
+        return
+    if order["telegram_id"] != message.from_user.id:
+        logging.warning("payment user mismatch order=%s", order_id)
+        return
+    await fulfill_paid_order(bot, order_id, source="stars-xtr")
 
 
 def check_crypto_invoice(invoice_id: str) -> str:
@@ -1380,15 +1547,18 @@ async def admin_callbacks(call: CallbackQuery, bot: Bot):
         return
 
     if action == "prices":
-        lines = [f"{em('money')} <b>Цены</b>\n"]
+        lines = [f"<b>Цены (USD)</b>\n1 USD = {STARS_PER_USD} Stars\n"]
         rows = []
         for cat, sec in CATALOG.items():
+            if not sec.get("products"):
+                continue
             lines.append(f"\n<b>{sec['title']}</b>")
             for p in sec["products"]:
                 price = store.get_price(p["id"])
-                lines.append(f"• {p['title']} — <b>{price} ₽</b>")
-                rows.append((button(f"{p['id']} → {price}₽", f"adm:setprice:{p['id']}", "money"),))
-        rows.append((button("⬅️ Назад", "adm:home", "home"),))
+                stars = usd_to_stars(price)
+                lines.append(f"• {p['title']} — <b>${price}</b> ({stars} Stars)")
+                rows.append((button(f"{p['id']} → ${price}", f"adm:setprice:{p['id']}", "money"),))
+        rows.append((button("Назад", "adm:home", "home"),))
         await call.message.answer("\n".join(lines), reply_markup=keyboard(*rows))
         return
 
@@ -1398,9 +1568,11 @@ async def admin_callbacks(call: CallbackQuery, bot: Bot):
             await call.message.answer("Нет товара")
             return
         admin_input[uid] = {"kind": "price", "product_id": pid}
+        cur = store.get_price(pid)
         await call.message.answer(
-            f"Новая цена для <b>{escape(PRODUCTS[pid]['title'])}</b> "
-            f"(сейчас {store.get_price(pid)} ₽).\nОтправь число:"
+            f"Новая цена в <b>USD</b> для <b>{escape(PRODUCTS[pid]['title'])}</b>\n"
+            f"Сейчас: <b>${cur}</b> = {usd_to_stars(cur)} Stars\n"
+            f"Отправь число (например 5 или 2.5):"
         )
         return
 
@@ -1655,16 +1827,18 @@ async def text_handler(message: Message, bot: Bot):
         kind = stage.get("kind")
         if kind == "price" and uid == OWNER_ID:
             try:
-                price = int(text)
-                if not 1 <= price <= 10**7:
+                price = float(text.replace(",", "."))
+                if not 0.01 <= price <= 10**7:
                     raise ValueError
             except ValueError:
-                await message.answer("Число от 1 до 10 000 000")
+                await message.answer("Число USD от 0.01 (например 5 или 2.5)")
                 return
             store.set_price(stage["product_id"], price)
             admin_input.pop(uid, None)
+            stars = usd_to_stars(price)
             await message.answer(
-                f"{em('check')} {PRODUCTS[stage['product_id']]['title']} → <b>{price} ₽</b>",
+                f"{PRODUCTS[stage['product_id']]['title']} → <b>${price}</b> "
+                f"({stars} Stars)",
                 reply_markup=admin_panel_kb(True),
             )
             return
@@ -1847,36 +2021,7 @@ async def crypto_poller(bot: Bot):
                 if status == "paid":
                     if not store.mark_paid_crypto(oid):
                         continue
-                    order = store.get(oid)
-                    try:
-                        result = await asyncio.to_thread(grant_to_game, order, game_config())
-                        store.delivered(oid)
-                        if isinstance(result, str) and result.startswith("pwd:"):
-                            await _notify_password(bot, order, result[4:])
-                        else:
-                            await bot.send_message(
-                                order["telegram_id"],
-                                f"{em('check')} <b>Оплата получена!</b>\n"
-                                f"Заказ #{oid} — <b>{escape(order['item_title'])}</b>\n"
-                                f"Ник: <code>{escape(order['nickname'])}</code>",
-                            )
-                        try:
-                            await bot.send_message(
-                                OWNER_ID,
-                                f"{em('crypto')} Авто #{oid} → {escape(order['nickname'])}",
-                            )
-                        except Exception:
-                            pass
-                    except GrantError as e:
-                        store.db.execute(
-                            "UPDATE orders SET status='review', error_text=?, updated_at=? WHERE id=?",
-                            (str(e)[:500], now(), oid),
-                        )
-                        store.db.commit()
-                        await bot.send_message(
-                            OWNER_ID,
-                            f"{em('warning')} Crypto оплачен, выдача #{oid} упала:\n{escape(str(e))}",
-                        )
+                    await fulfill_paid_order(bot, oid, source="crypto")
                 elif status == "expired":
                     store.cancel(oid, row["telegram_id"])
                     try:
@@ -1902,6 +2047,10 @@ async def main():
     # Web App HTTP API (нужен HTTPS-прокси / tunnel → WEBAPP_URL)
     try:
         from web_server import start_web_server
+
+        async def _stars_link(order: dict) -> str:
+            return await create_stars_invoice_link_with_bot(bot, order)
+
         ctx = {
             "bot_token": BOT_TOKEN,
             "bot": bot,
@@ -1913,11 +2062,19 @@ async def main():
             "account_exists": account_exists,
             "is_subscribed": is_subscribed,
             "create_crypto_invoice": create_crypto_invoice,
+            "create_stars_invoice_link": _stars_link,
+            "grant_to_game": grant_to_game,
+            "notify_password": _notify_password,
             "cryptobot_token": CRYPTOBOT_TOKEN,
             "stars_user": STARS_USER,
             "owner_id": OWNER_ID,
             "channel_username": CHANNEL_USERNAME,
             "apk_url": APK_DOWNLOAD_URL,
+            "stars_per_usd": STARS_PER_USD,
+            "money_per_usd": MONEY_PER_USD,
+            "money_min_usd": MONEY_MIN_USD,
+            # True = после «Я отправил подарок» выдаём сразу (без ручного ok:)
+            "auto_grant_stars_gift": True,
             "asyncio": asyncio,
         }
         await start_web_server(ctx, WEBAPP_HOST, WEBAPP_PORT)

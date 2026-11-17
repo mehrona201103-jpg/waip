@@ -47,15 +47,20 @@ def create_app(ctx: dict) -> web.Application:
         catalog = {}
         for cat, sec in ctx["catalog"].items():
             products = []
-            for p in sec["products"]:
+            for p in sec.get("products") or []:
                 products.append({
                     "id": p["id"],
                     "title": p["title"],
                     "kind": p["kind"],
                     "units": p["units"],
-                    "price": store.get_price(p["id"]),
+                    "price": float(store.get_price(p["id"])),
                 })
-            catalog[cat] = {"title": sec["title"], "products": products}
+            catalog[cat] = {
+                "title": sec["title"],
+                "icon": sec.get("icon") or cat,
+                "custom": bool(sec.get("custom")),
+                "products": products,
+            }
         return catalog
 
     async def player_block(nick: str):
@@ -66,8 +71,10 @@ def create_app(ctx: dict) -> web.Application:
             row = await ctx["asyncio"].to_thread(ctx["fetch_player"], nick, cfg)
             if not row:
                 return None
+
             def g(col):
                 return row.get(col) or row.get(col.lower())
+
             return {
                 "level": g(cfg.level_col),
                 "admin": g(cfg.admin_col),
@@ -121,6 +128,9 @@ def create_app(ctx: dict) -> web.Application:
             "crypto_enabled": bool(ctx.get("cryptobot_token")),
             "stars_user": ctx.get("stars_user") or "mukhammad_im",
             "apk_url": ctx.get("apk_url") or None,
+            "stars_per_usd": int(ctx.get("stars_per_usd") or 50),
+            "money_per_usd": int(ctx.get("money_per_usd") or 100000),
+            "money_min_usd": float(ctx.get("money_min_usd") or 1),
         })
 
     async def check_sub(request: web.Request):
@@ -137,9 +147,10 @@ def create_app(ctx: dict) -> web.Application:
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=401)
         uid = int(user["id"])
-        if not await check_subscribed(uid):
-            return web.json_response({"error": "Сначала подпишись на канал"}, status=403)
         body = await request.json()
+        is_switch = bool(body.get("switch"))
+        if not is_switch and not await check_subscribed(uid):
+            return web.json_response({"error": "Сначала подпишись на канал"}, status=403)
         nick = (body.get("nickname") or "").strip()
         import re
         if not re.fullmatch(r"[A-Za-z0-9_\[\]-]{3,24}", nick):
@@ -162,6 +173,20 @@ def create_app(ctx: dict) -> web.Application:
                 "player": player,
             },
         })
+
+    async def logout(request: web.Request):
+        try:
+            user = auth_user(request)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=401)
+        uid = int(user["id"])
+        if store.active(uid):
+            return web.json_response(
+                {"error": "Сначала заверши или отмени активный заказ"},
+                status=409,
+            )
+        store.clear_nickname(uid)
+        return web.json_response({"ok": True, "registered": False, "nickname": None})
 
     async def orders(request: web.Request):
         try:
@@ -215,37 +240,72 @@ def create_app(ctx: dict) -> web.Application:
             return web.json_response({"error": "Неверный способ оплаты"}, status=400)
         if method == "crypto" and not ctx.get("cryptobot_token"):
             return web.json_response({"error": "CryptoBot не настроен"}, status=400)
-        item = store.product(product_id)
-        if not item:
-            return web.json_response({"error": "Товар не найден"}, status=404)
+
+        stars_per_usd = int(ctx.get("stars_per_usd") or 50)
+        money_per_usd = int(ctx.get("money_per_usd") or 100000)
+        money_min_usd = float(ctx.get("money_min_usd") or 1)
+
+        units_override = None
+        final_usd = None
+        item = None
+
+        if product_id == "money_custom":
+            try:
+                usd = float(body.get("usd") or 0)
+                units = int(body.get("units") or 0)
+            except (TypeError, ValueError):
+                return web.json_response({"error": "Неверная сумма"}, status=400)
+            if usd < money_min_usd:
+                return web.json_response({"error": f"Минимум ${money_min_usd}"}, status=400)
+            if units <= 0:
+                units = int(round(usd * money_per_usd))
+            item = {
+                "id": "money_custom",
+                "title": f"{units:,} игровой валюты".replace(",", " "),
+                "kind": "money",
+                "units": units,
+                "price": usd,
+                "category": "money",
+            }
+            final_usd = usd
+            units_override = units
+        else:
+            item = store.product(product_id)
+            if not item:
+                return web.json_response({"error": "Товар не найден"}, status=404)
+            final_usd = float(item["price"])
+
         if store.active(uid):
             return web.json_response({"error": "Есть незавершённый заказ"}, status=409)
 
         promo_code = body.get("promo")
         discount = 0
-        final_price = item["price"]
         if promo_code:
             promo = store.get_promo(promo_code)
             if promo and (promo["max_uses"] == 0 or promo["used_count"] < promo["max_uses"]):
                 discount = int(promo["percent"])
-                final_price = max(1, int(item["price"] * (100 - discount) / 100))
+                final_usd = max(0.01, final_usd * (100 - discount) / 100)
             else:
                 promo_code = None
 
         try:
             order = store.create(
-                uid, nick, product_id, item,
+                uid, nick, item["id"], item,
                 payment_method=method,
                 promo_code=promo_code,
                 discount=discount,
-                final_price=final_price,
+                final_price=final_usd,
+                units_override=units_override,
             )
             if promo_code:
                 store.use_promo(promo_code)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=409)
 
+        stars = int(order.get("stars") or max(1, round(float(final_usd) * stars_per_usd)))
         pay_url = None
+        invoice_link = None
+
         if method == "crypto":
             try:
                 inv = await ctx["asyncio"].to_thread(ctx["create_crypto_invoice"], order)
@@ -257,131 +317,154 @@ def create_app(ctx: dict) -> web.Application:
                 store.cancel(order["id"], uid)
                 return web.json_response({"error": f"CryptoBot: {e}"}, status=502)
 
-        bot = ctx.get("bot")
-        if bot and method == "stars":
-            try:
-                stars = ctx.get("stars_user") or "mukhammad_im"
-                await bot.send_message(
-                    uid,
-                    f"🛒 <b>Заказ #{order['id']} из WAIP SHOP</b>\n"
-                    f"{item['title']} — <b>{final_price} ₽</b>\n\n"
-                    f"Оплата Stars: подарок <b>@{stars}</b>, затем загрузи скрин в приложении "
-                    f"или пришли фото <b>сюда в чат</b>.",
-                )
-            except Exception:
-                logging.exception("notify stars")
+        if method == "stars":
+            create_link = ctx.get("create_stars_invoice_link")
+            if create_link:
+                try:
+                    invoice_link = await create_link(order)
+                except Exception:
+                    logging.exception("stars invoice link")
+                    invoice_link = None
+
+            bot = ctx.get("bot")
+            if bot and not invoice_link:
+                stars_user = ctx.get("stars_user") or "mukhammad_im"
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"<b>Заказ #{order['id']}</b>\n"
+                        f"{item['title']}\n"
+                        f"К оплате: <b>{stars} Stars</b> (${final_usd})\n\n"
+                        f"Отправь подарок (Gift) на <b>@{stars_user}</b> "
+                        f"на сумму <b>{stars} Stars</b>.\n"
+                        f"Скриншоты не нужны — после отправки подтверди в приложении.",
+                    )
+                except Exception:
+                    logging.exception("notify stars")
 
         return web.json_response({
             "order_id": order["id"],
-            "price": final_price,
+            "price": stars,
+            "usd": final_usd,
+            "stars": stars,
             "status": order["status"],
             "pay_url": pay_url,
+            "invoice_link": invoice_link,
         })
 
-    async def receipt_upload(request: web.Request):
+    async def order_status(request: web.Request):
         try:
             user = auth_user(request)
         except ValueError as e:
             return web.json_response({"error": str(e)}, status=401)
         uid = int(user["id"])
-        reader = await request.multipart()
-        order_id = None
-        file_bytes = None
-        filename = "receipt.jpg"
-        content_type = "image/jpeg"
-
-        while True:
-            part = await reader.next()
-            if part is None:
-                break
-            if part.name == "order_id":
-                order_id = int((await part.text()).strip())
-            elif part.name == "file":
-                filename = part.filename or filename
-                content_type = part.headers.get("Content-Type", content_type)
-                file_bytes = await part.read(decode=False)
-
-        if not order_id or not file_bytes:
-            return web.json_response({"error": "Нужны order_id и файл"}, status=400)
-        if len(file_bytes) > 10 * 1024 * 1024:
-            return web.json_response({"error": "Файл слишком большой"}, status=400)
-
-        order = store.get(order_id)
+        try:
+            oid = int(request.query.get("id") or 0)
+        except ValueError:
+            return web.json_response({"error": "bad id"}, status=400)
+        order = store.get(oid)
         if not order or order["telegram_id"] != uid:
-            return web.json_response({"error": "Заказ не найден"}, status=404)
-        if order["status"] != "awaiting_receipt":
-            return web.json_response({"error": "Заказ не ждёт чек"}, status=409)
+            return web.json_response({"error": "Не найден"}, status=404)
+        return web.json_response({
+            "id": order["id"],
+            "status": order["status"],
+            "item_title": order["item_title"],
+            "price": order["price"],
+        })
 
-        bot = ctx.get("bot")
-        if not bot:
-            return web.json_response({"error": "Бот недоступен"}, status=503)
-
-        from aiogram.types import BufferedInputFile
-        is_pdf = "pdf" in (content_type or "") or filename.lower().endswith(".pdf")
-        bio = BufferedInputFile(file_bytes, filename=filename)
-
-        # send to user chat first to get file_id, or send directly to reviewers
+    async def stars_confirm(request: web.Request):
+        """Пользователь подтвердил отправку подарка — ставим в processing и уведомляем владельца.
+        Выдача автоматически, если включён AUTO_GRANT_STARS_GIFT, иначе owner может нажать ok.
+        """
         try:
-            if is_pdf:
-                msg = await bot.send_document(uid, bio, caption=f"Чек к заказу #{order_id}")
-                file_id = msg.document.file_id
-                unique_id = msg.document.file_unique_id
-                kind = "document"
-            else:
-                msg = await bot.send_photo(uid, bio, caption=f"Чек к заказу #{order_id}")
-                file_id = msg.photo[-1].file_id
-                unique_id = msg.photo[-1].file_unique_id
-                kind = "photo"
-        except Exception as e:
-            logging.exception("upload receipt to tg")
-            return web.json_response({"error": f"Не удалось загрузить в Telegram: {e}"}, status=502)
-
-        try:
-            ok = store.submit_receipt(order_id, uid, file_id, unique_id, kind)
+            user = auth_user(request)
         except ValueError as e:
-            return web.json_response({"error": str(e)}, status=409)
-        if not ok:
-            return web.json_response({"error": "Заказ уже изменился"}, status=409)
+            return web.json_response({"error": str(e)}, status=401)
+        uid = int(user["id"])
+        body = await request.json()
+        try:
+            oid = int(body.get("order_id") or 0)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "bad order_id"}, status=400)
+        order = store.get(oid)
+        if not order or order["telegram_id"] != uid:
+            return web.json_response({"error": "Не найден"}, status=404)
+        if order["status"] not in ("awaiting_stars", "awaiting_receipt"):
+            return web.json_response({"error": "Заказ не ждёт оплату"}, status=409)
 
-        # notify owner + moderators in bot chat (not web)
-        from html import escape as esc
-        o = store.get(order_id)
-        caption = (
-            f"🧾 <b>Заказ #{o['id']}</b> (из WebApp)\n"
-            f"Товар: <b>{esc(o['item_title'])}</b>\n"
-            f"Ник: <code>{esc(o['nickname'])}</code>\n"
-            f"TG ID: <code>{o['telegram_id']}</code>\n"
-            f"Сумма: <b>{o['price']} ₽</b>\n"
-            f"Оплата: ✨ Stars\n"
-            f"Статус: <code>review</code>"
-        )
-        # build review keyboard via callback data same as bot
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить и выдать", callback_data=f"ok:{order_id}")],
-            [InlineKeyboardButton(text="❌ Отклонить чек", callback_data=f"no:{order_id}")],
-        ])
-        targets = {ctx.get("owner_id")}
-        for m in store.list_moderators():
-            targets.add(m["telegram_id"])
-        for tid in targets:
-            if not tid:
-                continue
+        # Переводим в processing / auto-grant
+        auto = bool(ctx.get("auto_grant_stars_gift"))
+        with store.db:
+            store.db.execute(
+                "UPDATE orders SET status=?, updated_at=datetime('now') WHERE id=?",
+                ("processing" if auto else "review", oid),
+            )
+        order = store.get(oid)
+        bot = ctx.get("bot")
+        owner_id = ctx.get("owner_id")
+
+        if auto and bot:
             try:
-                if kind == "photo":
-                    await bot.send_photo(tid, file_id, caption=caption, reply_markup=markup)
+                grant_fn = ctx.get("grant_to_game")
+                game_cfg = ctx["get_game_config"]()
+                result = await ctx["asyncio"].to_thread(grant_fn, order, game_cfg)
+                store.delivered(oid)
+                if isinstance(result, str) and result.startswith("pwd:"):
+                    notify_pwd = ctx.get("notify_password")
+                    if notify_pwd:
+                        await notify_pwd(bot, order, result[4:])
                 else:
-                    await bot.send_document(tid, file_id, caption=caption, reply_markup=markup)
+                    await bot.send_message(
+                        uid,
+                        f"<b>Оплата принята</b>\nЗаказ #{oid} — {order['item_title']}\n"
+                        f"Ник: <code>{order['nickname']}</code>",
+                    )
+                if owner_id:
+                    try:
+                        await bot.send_message(
+                            owner_id,
+                            f"Stars gift auto #{oid} → {order['nickname']} · {order['item_title']}",
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.exception("auto grant stars gift")
+                with store.db:
+                    store.db.execute(
+                        "UPDATE orders SET status='review', error_text=?, updated_at=datetime('now') WHERE id=?",
+                        (str(e)[:500], oid),
+                    )
+                if owner_id and bot:
+                    try:
+                        await bot.send_message(owner_id, f"Stars gift paid but grant failed #{oid}: {e}")
+                    except Exception:
+                        pass
+                return web.json_response({"error": "Оплата отмечена, выдача с ошибкой — админ проверит"}, status=500)
+        elif bot and owner_id:
+            try:
+                from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Выдать", callback_data=f"ok:{oid}"),
+                    InlineKeyboardButton(text="Отклонить", callback_data=f"no:{oid}"),
+                ]])
+                await bot.send_message(
+                    owner_id,
+                    f"<b>Stars gift #{oid}</b>\n"
+                    f"{order['item_title']} · {order['price']} Stars\n"
+                    f"Ник: <code>{order['nickname']}</code>\n"
+                    f"User: <code>{uid}</code>",
+                    reply_markup=kb,
+                )
             except Exception:
-                logging.exception("notify reviewer %s", tid)
+                logging.exception("notify owner stars gift")
 
-        return web.json_response({"ok": True, "order_id": order_id, "status": "review"})
+        return web.json_response({"ok": True, "status": store.get(oid)["status"]})
+
+    async def health(_request: web.Request):
+        return web.json_response({"ok": True})
 
     async def index(_request: web.Request):
         return web.FileResponse(WEBAPP_DIR / "index.html")
-
-    async def health(_request: web.Request):
-        return web.json_response({"ok": True, "service": "waip-shop"})
 
     app.router.add_get("/", index)
     app.router.add_get("/webapp", index)
@@ -390,19 +473,21 @@ def create_app(ctx: dict) -> web.Application:
     app.router.add_get("/api/bootstrap", bootstrap)
     app.router.add_post("/api/check_sub", check_sub)
     app.router.add_post("/api/register", register)
+    app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/orders", orders)
     app.router.add_post("/api/promo", promo)
     app.router.add_post("/api/order", order_create)
-    app.router.add_post("/api/receipt", receipt_upload)
+    app.router.add_get("/api/order_status", order_status)
+    app.router.add_post("/api/stars_confirm", stars_confirm)
     app.router.add_get("/health", health)
     return app
 
 
-async def start_web_server(ctx: dict, host: str, port: int):
+async def start_web_server(ctx: dict, host: str = "0.0.0.0", port: int = 8080):
     app = create_app(ctx)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, host or "0.0.0.0", int(port or 8080))
     await site.start()
-    logging.info("WebApp server on http://%s:%s", host, port)
+    logging.info("WebApp listening on %s:%s", host, port)
     return runner
