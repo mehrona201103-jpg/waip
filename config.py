@@ -9,21 +9,21 @@ PAYMENT_DETAILS = "@mukhammad_im"
 STARS_GIFT_USERNAME = "mukhammad_im"  # без @
 
 # 3. CryptoBot API Token (от @CryptoBot → Crypto Pay → Create App)
-CRYPTOBOT_TOKEN = ""
+CRYPTOBOT_TOKEN = "680189:AA5RlEvQTW9TRoOxdUjtmJhIpBNUBW53ZqY"
 
 # 4. Канал для обязательной подписки (без @)
-CHANNEL_USERNAME = ""
-CHANNEL_ID = 0
+CHANNEL_USERNAME = "@waiprussia"
+CHANNEL_ID = -1004323576792
 
 # 5. Web App — HTTPS URL (обязательно для Mini App)
-WEBAPP_URL = ""
+WEBAPP_URL = "https://waip.onrender.com"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = 8080
 
 # 6. APK игры (GitHub Release direct link на .apk)
 # Пример: "https://github.com/USER/REPO/releases/download/v1.0/game.apk"
 # Или страница релизов: бот/webapp откроют ссылку для скачивания
-APK_DOWNLOAD_URL = "https://github.com/USER/REPO/releases/latest/download/game.apk"
+APK_DOWNLOAD_URL = "https://github.com/mehrona201103-jpg/waip/commits/waip"
 APK_BUTTON_TITLE = "📥 Скачать игру (APK)"
 
 # 7. Показывать премиум-эмодзи Telegram
